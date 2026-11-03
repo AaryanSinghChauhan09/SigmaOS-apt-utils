@@ -1,0 +1,9 @@
+[package]
+name = "apt-utils"
+version = "0.1.0"
+edition = "2021"
+description = "SigmaOS SigmaOS-apt-utils component - Inspired by Arch Linux and Debian"
+license = "MIT"
+repository = "https://github.com/AaryanSinghChauhan09/SigmaOS-apt-utils"
+
+[dependencies]
