@@ -1,7 +1,9 @@
-//! SigmaOS-apt-utils — apt-utils component
+//! SigmaOS-apt-utils — apt preferences/pinning rule parser.
 //!
-//! Part of the SigmaOS multi-repository component ecosystem. This crate
-//! declares its interface in `COMPONENT.toml` (`provides` / `depends_on`).
+//! Inspired by Debian's `apt-utils` family and `/etc/apt/preferences`:
+//! parses pinning stanzas (`Package`, `Pin`, `Pin-Priority`) that control
+//! which candidate version apt selects — the mechanism half of version
+//! selection policy. Stanzas are deb822-like, blank-line separated.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -9,77 +11,165 @@
 /// Errors raised by this component.
 #[derive(Debug, thiserror::Error)]
 pub enum ComponentError {
-    /// The requested operation is not supported by this component yet.
-    #[error("unsupported operation: {0}")]
-    Unsupported(&'static str),
+    /// A stanza was missing a required field.
+    #[error("stanza missing field: {0}")]
+    MissingField(&'static str),
 }
 
 /// Result alias for component operations.
 pub type ComponentResult<T> = Result<T, ComponentError>;
 
-/// A handle to an initialised component instance.
-#[derive(Debug, Default, Clone)]
-pub struct Component {
-    initialised: bool,
+/// One pinning rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    /// Package glob this rule applies to (e.g. `*`, `bash`, `linux-image-*`).
+    pub package: String,
+    /// Pin expression (e.g. `release a=stable`, `version 1.2*`, `origin X`).
+    pub pin: String,
+    /// Priority integer (higher wins; negative forbids).
+    pub priority: i32,
 }
 
-impl Component {
-    /// Create a new, uninitialised component handle.
+/// Parsed preferences file: ordered list of pin rules.
+#[derive(Debug, Default)]
+pub struct Preferences {
+    rules: Vec<Pin>,
+}
+
+impl Preferences {
+    /// Empty preferences.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Initialise the component. Returns `Ok(())` once ready.
-    pub fn init(&mut self) -> ComponentResult<()> {
-        self.initialised = true;
-        Ok(())
-    }
+    /// Parse `/etc/apt/preferences` text.
+    pub fn parse(input: &str) -> ComponentResult<Self> {
+        let mut prefs = Preferences::new();
+        let mut pkg = String::new();
+        let mut pin = String::new();
+        let mut prio: Option<i32> = None;
+        let mut have = false;
 
-    /// Returns `true` once [`Component::init`] has succeeded.
-    pub fn is_ready(&self) -> bool {
-        self.initialised
-    }
-
-    /// Placeholder for the component's primary operation.
-    ///
-    /// Replace with the real implementation for this component; keep the
-    /// `ComponentResult` contract and update `COMPONENT.toml` accordingly.
-    pub fn run(&self) -> ComponentResult<()> {
-        if !self.initialised {
-            return Err(ComponentError::Unsupported("not initialised"));
+        macro_rules! flush {
+            () => {
+                if have {
+                    if pkg.is_empty() { return Err(ComponentError::MissingField("Package")); }
+                    if pin.is_empty() { return Err(ComponentError::MissingField("Pin")); }
+                    let p = prio.unwrap_or(500);
+                    prefs.rules.push(Pin { package: pkg.clone(), pin: pin.clone(), priority: p });
+                }
+                pkg.clear(); pin.clear(); prio = None; have = false;
+            };
         }
-        Ok(())
+
+        for raw in input.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') { flush!(); continue; }
+            let Some((k, v)) = line.split_once(':') else { continue };
+            match k.trim() {
+                "Package" => { pkg = v.trim().to_string(); have = true; }
+                "Pin" => { pin = v.trim().to_string(); }
+                "Pin-Priority" => { prio = v.trim().parse().ok(); }
+                _ => {}
+            }
+        }
+        flush!();
+        Ok(prefs)
+    }
+
+    /// All rules in file order.
+    pub fn rules(&self) -> &[Pin] {
+        &self.rules
+    }
+
+    /// Whether `package` name matches a rule's `Package` glob.
+    /// Supports `*` wildcard and exact names.
+    pub fn matches(rule_pkg: &str, name: &str) -> bool {
+        if rule_pkg == "*" { return true; }
+        if !rule_pkg.contains('*') { return rule_pkg == name; }
+        // Simple glob: split on '*', ensure ordered substring match.
+        let parts: Vec<&str> = rule_pkg.split('*').collect();
+        let mut rest = name;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() { continue; }
+            if i == 0 && !rule_pkg.starts_with('*') {
+                if !rest.starts_with(part) { return false; }
+                rest = &rest[part.len()..];
+            } else if i == parts.len() - 1 && !rule_pkg.ends_with('*') {
+                return rest.ends_with(part);
+            } else {
+                match rest.find(part) {
+                    Some(pos) => rest = &rest[pos + part.len()..],
+                    None => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Rules applicable to `package`, in file order.
+    pub fn for_package(&self, package: &str) -> Vec<&Pin> {
+        self.rules.iter().filter(|r| Self::matches(&r.package, package)).collect()
+    }
+
+    /// The highest-priority rule for `package`, if any.
+    pub fn best_for(&self, package: &str) -> Option<&Pin> {
+        self.for_package(package).into_iter().max_by_key(|r| r.priority)
+    }
+
+    /// Number of rules.
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Whether empty.
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
 
-    // Arrange-Act-Assert
+    const PREFS: &str = "Package: *\nPin: release a=stable\nPin-Priority: 500\n\nPackage: bash\nPin: version 5.2*\nPin-Priority: 990\n\nPackage: linux-image-*\nPin: release n=sid\nPin-Priority: -1\n";
+
     #[test]
-    fn init_marks_component_ready() {
-        // Arrange
-        let mut c = Component::new();
-        assert!(!c.is_ready());
-
-        // Act
-        c.init().unwrap();
-
-        // Assert
-        assert!(c.is_ready());
+    fn parses_pin_stanzas() {
+        let p = Preferences::parse(PREFS).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.rules()[0].package, "*");
+        assert_eq!(p.rules()[0].pin, "release a=stable");
+        assert_eq!(p.rules()[0].priority, 500);
+        assert_eq!(p.rules()[1].priority, 990);
     }
 
     #[test]
-    fn run_requires_init() {
-        // Arrange
-        let c = Component::new();
+    fn glob_matching() {
+        assert!(Preferences::matches("*", "anything"));
+        assert!(Preferences::matches("bash", "bash"));
+        assert!(!Preferences::matches("bash", "zsh"));
+        assert!(Preferences::matches("linux-image-*", "linux-image-6.1"));
+        assert!(!Preferences::matches("linux-image-*", "kernel"));
+    }
 
-        // Act
-        let res = c.run();
+    #[test]
+    fn for_package_and_best() {
+        let p = Preferences::parse(PREFS).unwrap();
+        let bash = p.for_package("bash");
+        assert_eq!(bash.len(), 2); // * and bash
+        let best = p.best_for("bash").unwrap();
+        assert_eq!(best.priority, 990); // version pin beats release pin
+    }
 
-        // Assert
-        assert!(res.is_err());
+    #[test]
+    fn comments_and_blanks() {
+        let p = Preferences::parse("# comment\n\nPackage: x\nPin: p\nPin-Priority: 100\n").unwrap();
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn empty_ok() {
+        assert!(Preferences::parse("").unwrap().is_empty());
     }
 }
